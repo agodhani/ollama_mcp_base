@@ -184,6 +184,44 @@ asyncio.run(main())
 
 ---
 
+## Running the Test Client
+
+`test_client.py` spawns the server as a subprocess over stdio, auto-discovers everything it exposes, and exercises each tool, resource, and prompt with sample arguments — no configuration required.
+
+**Prerequisites:** Ollama must be running and `uv sync` must have been run first.
+
+```bash
+uv run python test_client.py
+```
+
+Expected output:
+
+```
+Connecting to server: ./main.py
+
+──────────────────────────────────────────────────
+  Tools (1)
+──────────────────────────────────────────────────
+  • echo: Echo back the provided text
+
+Calling each tool with sample arguments...
+  ✓ echo({'text': 'sample_text'}) → 'Echo: sample_text'
+
+──────────────────────────────────────────────────
+  Resources (0)
+──────────────────────────────────────────────────
+
+──────────────────────────────────────────────────
+  Prompts (0)
+──────────────────────────────────────────────────
+
+Done.
+```
+
+The test client builds minimal sample arguments automatically from each tool's JSON Schema (required fields only), so it works out of the box as you add new tools.
+
+---
+
 ## Configuration
 
 All settings can be overridden with environment variables (no code changes needed).
