@@ -1,34 +1,39 @@
 """
 Base MCP Client Implementation
 
-This module provides a base class for creating MCP clients that connect to
-MCP servers. The client can:
-- Discover available tools, resources, and prompts
-- Call tools on the server
-- Read resources from the server
-- Use prompt templates
+Provides a base class for connecting to MCP servers, discovering their
+capabilities, and calling tools/resources/prompts.
 
 Key Concepts:
-- Client connects to server via stdio (standard input/output)
-- Client discovers capabilities by listing tools/resources/prompts
-- Client sends requests and receives responses
-- Client can be used in applications or other automation workflows
+- Client spawns a server process (or connects to one) via stdio
+- Client discovers capabilities with discover()
+- Client calls tools, reads resources, and uses prompts
+- Use as an async context manager for automatic connection lifecycle
+
+Example Usage:
+    async with BaseMCPClient(server_script_path="./server/base_server.py") as client:
+        await client.discover()
+
+        result = await client.call_tool("echo", {"text": "hello"})
+        content = await client.read_resource("file:///data.json")
+        messages = await client.get_prompt("my_prompt", {"var": "value"})
 """
 
-import asyncio
 import logging
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass
-import mcp
-from mcp.client.stdio import stdio_client, StdioServerParameters
 
-logging.basicConfig(level=logging.INFO)
+import mcp
+from mcp.client.stdio import StdioServerParameters, stdio_client
+
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ToolInfo:
     """Information about an available tool."""
+
     name: str
     description: str
     input_schema: Dict[str, Any]
@@ -37,6 +42,7 @@ class ToolInfo:
 @dataclass
 class ResourceInfo:
     """Information about an available resource."""
+
     uri: str
     name: str
     description: str
@@ -46,285 +52,260 @@ class ResourceInfo:
 @dataclass
 class PromptInfo:
     """Information about an available prompt."""
+
     name: str
     description: str
-    arguments: List[Dict[str, Any]]
+    arguments: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class BaseMCPClient:
     """
     Base class for MCP clients.
-    
-    This class handles connection to MCP servers and provides methods
-    to interact with server capabilities.
-    
-    Architecture:
-    1. Client spawns server process (or connects to running server)
-    2. Client performs capability discovery
-    3. Client can call tools, read resources, use prompts
-    4. Client manages connection lifecycle
-    
-    Example Usage:
-        client = BaseMCPClient(
-            server_script_path="./my_server.py"
-        )
-        
-        async with client:
-            # Discover capabilities
+
+    Handles the full connection lifecycle to an MCP server via stdio and
+    provides typed methods to interact with server capabilities.
+
+    Use as a context manager:
+        async with BaseMCPClient("./my_server.py") as client:
             await client.discover()
-            
-            # Use a tool
-            result = await client.call_tool(
-                "search",
-                {"query": "MCP protocol"}
-            )
-            
-            # Read a resource
-            content = await client.read_resource("file:///data.json")
+            result = await client.call_tool("search", {"query": "hello"})
+
+    Or manage the lifecycle manually:
+        client = BaseMCPClient("./my_server.py")
+        await client.connect()
+        await client.discover()
+        ...
+        await client.disconnect()
     """
-    
+
     def __init__(
         self,
         server_script_path: str,
         server_args: Optional[List[str]] = None,
-        env: Optional[Dict[str, str]] = None
+        env: Optional[Dict[str, str]] = None,
     ):
         """
-        Initialize the MCP client.
-        
         Args:
-            server_script_path: Path to the server script to run
-            server_args: Additional arguments to pass to server
-            env: Environment variables for the server process
+            server_script_path: Path to the Python server script to spawn
+            server_args: Additional CLI arguments passed to the server script
+            env: Extra environment variables for the server process.
+                 Pass None (default) to inherit the current environment.
         """
         self.server_script_path = server_script_path
         self.server_args = server_args or []
-        self.env = env or {}
-        
-        # These will be set when connected
-        self.client = None
-        self.session = None
-        self.read_stream = None
-        self.write_stream = None
-        
-        # Cached capability information
+        self.env = env  # None = inherit parent env; {} = empty env (usually wrong)
+
+        self.session: Optional[mcp.ClientSession] = None
+        self._exit_stack: Optional[AsyncExitStack] = None
+
+        # Populated after discover()
         self.tools: Dict[str, ToolInfo] = {}
         self.resources: Dict[str, ResourceInfo] = {}
         self.prompts: Dict[str, PromptInfo] = {}
-        
+
         logger.info(f"Initialized client for server: {server_script_path}")
-    
+
     async def __aenter__(self):
-        """Context manager entry - connect to server."""
         await self.connect()
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - disconnect from server."""
         await self.disconnect()
-    
+
     async def connect(self):
         """
-        Connect to the MCP server.
-        
-        This spawns the server process and establishes communication.
+        Spawn the server process and establish the MCP session.
+
+        Uses AsyncExitStack so both the stdio transport and the MCP session
+        are cleaned up properly on disconnect().
         """
         logger.info("Connecting to server...")
-        
+
         server_params = StdioServerParameters(
             command="python",
             args=[self.server_script_path] + self.server_args,
-            env=self.env
+            env=self.env,
         )
-        
-        # Create stdio client connection
-        self.read_stream, self.write_stream = await stdio_client(server_params)
-        
-        # Create MCP client instance
-        self.client = mcp.ClientSession(self.read_stream, self.write_stream)
-        
-        # Initialize the session
-        await self.client.__aenter__()
-        
+
+        self._exit_stack = AsyncExitStack()
+
+        read_stream, write_stream = await self._exit_stack.enter_async_context(
+            stdio_client(server_params)
+        )
+        self.session = await self._exit_stack.enter_async_context(
+            mcp.ClientSession(read_stream, write_stream)
+        )
+        await self.session.initialize()
+
         logger.info("Connected to server")
-    
+
     async def disconnect(self):
-        """Disconnect from the MCP server."""
-        if self.client:
-            await self.client.__aexit__(None, None, None)
+        """Close the MCP session and stop the server process."""
+        if self._exit_stack:
+            await self._exit_stack.aclose()
+            self._exit_stack = None
+            self.session = None
             logger.info("Disconnected from server")
-    
+
     async def discover(self):
         """
         Discover all capabilities available on the server.
-        
-        This populates the tools, resources, and prompts caches.
-        Call this after connecting to learn what the server offers.
+
+        Populates self.tools, self.resources, and self.prompts.
+        Call this after connect() to learn what the server exposes.
         """
+        if not self.session:
+            raise RuntimeError("Not connected. Call connect() first.")
+
         logger.info("Discovering server capabilities...")
-        
-        # Discover tools
-        tools_result = await self.client.list_tools()
+
+        tools_result = await self.session.list_tools()
         self.tools = {
-            tool.name: ToolInfo(
-                name=tool.name,
-                description=tool.description,
-                input_schema=tool.inputSchema
+            t.name: ToolInfo(
+                name=t.name,
+                description=t.description,
+                input_schema=t.inputSchema,
             )
-            for tool in tools_result.tools
+            for t in tools_result.tools
         }
         logger.info(f"Discovered {len(self.tools)} tools")
-        
-        # Discover resources
-        resources_result = await self.client.list_resources()
+
+        resources_result = await self.session.list_resources()
         self.resources = {
-            resource.uri: ResourceInfo(
-                uri=resource.uri,
-                name=resource.name,
-                description=resource.description,
-                mime_type=resource.mimeType
+            r.uri: ResourceInfo(
+                uri=r.uri,
+                name=r.name,
+                description=r.description,
+                mime_type=r.mimeType,
             )
-            for resource in resources_result.resources
+            for r in resources_result.resources
         }
         logger.info(f"Discovered {len(self.resources)} resources")
-        
-        # Discover prompts
-        prompts_result = await self.client.list_prompts()
+
+        prompts_result = await self.session.list_prompts()
         self.prompts = {
-            prompt.name: PromptInfo(
-                name=prompt.name,
-                description=prompt.description,
-                arguments=prompt.arguments if hasattr(prompt, 'arguments') else []
+            p.name: PromptInfo(
+                name=p.name,
+                description=p.description,
+                arguments=p.arguments if hasattr(p, "arguments") else [],
             )
-            for prompt in prompts_result.prompts
+            for p in prompts_result.prompts
         }
         logger.info(f"Discovered {len(self.prompts)} prompts")
-    
-    async def call_tool(
-        self,
-        tool_name: str,
-        arguments: Dict[str, Any]
-    ) -> Any:
+
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
         """
         Call a tool on the server.
-        
+
         Args:
             tool_name: Name of the tool to call
-            arguments: Arguments to pass to the tool
-        
+            arguments: Arguments matching the tool's input schema
+
         Returns:
-            Tool execution result
-        
+            Tool execution result (text content)
+
         Raises:
-            ValueError: If tool doesn't exist
+            RuntimeError: If not connected
+            ValueError: If tool_name is not in discovered tools
         """
+        if not self.session:
+            raise RuntimeError("Not connected. Call connect() first.")
         if tool_name not in self.tools:
-            available = ", ".join(self.tools.keys())
             raise ValueError(
                 f"Tool '{tool_name}' not found. "
-                f"Available tools: {available}"
+                f"Available: {', '.join(self.tools)}"
             )
-        
+
         logger.info(f"Calling tool: {tool_name}")
-        
-        result = await self.client.call_tool(tool_name, arguments)
-        
-        # Extract text content from result
-        if result.content:
-            return result.content[0].text
-        return None
-    
-    async def read_resource(self, uri: str) -> str:
+        result = await self.session.call_tool(tool_name, arguments)
+        return result.content[0].text if result.content else None
+
+    async def read_resource(self, uri: str) -> Optional[str]:
         """
         Read a resource from the server.
-        
+
         Args:
             uri: URI of the resource to read
-        
+
         Returns:
-            Resource content
-        
+            Resource content as a string
+
         Raises:
-            ValueError: If resource doesn't exist
+            RuntimeError: If not connected
+            ValueError: If uri is not in discovered resources
         """
+        if not self.session:
+            raise RuntimeError("Not connected. Call connect() first.")
         if uri not in self.resources:
-            available = ", ".join(self.resources.keys())
             raise ValueError(
                 f"Resource '{uri}' not found. "
-                f"Available resources: {available}"
+                f"Available: {', '.join(self.resources)}"
             )
-        
+
         logger.info(f"Reading resource: {uri}")
-        
-        result = await self.client.read_resource(uri)
-        
-        # Extract content from result
-        if result.contents:
-            return result.contents[0].text
-        return None
-    
+        result = await self.session.read_resource(uri)
+        return result.contents[0].text if result.contents else None
+
     async def get_prompt(
         self,
         prompt_name: str,
-        arguments: Optional[Dict[str, str]] = None
+        arguments: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, str]]:
         """
-        Get a prompt template from the server.
-        
+        Get a prompt template from the server with variables filled in.
+
         Args:
             prompt_name: Name of the prompt
             arguments: Values for prompt variables
-        
+
         Returns:
-            List of message dicts with 'role' and 'content'
-        
+            List of {"role": str, "content": str} message dicts
+
         Raises:
-            ValueError: If prompt doesn't exist
+            RuntimeError: If not connected
+            ValueError: If prompt_name is not in discovered prompts
         """
+        if not self.session:
+            raise RuntimeError("Not connected. Call connect() first.")
         if prompt_name not in self.prompts:
-            available = ", ".join(self.prompts.keys())
             raise ValueError(
                 f"Prompt '{prompt_name}' not found. "
-                f"Available prompts: {available}"
+                f"Available: {', '.join(self.prompts)}"
             )
-        
+
         logger.info(f"Getting prompt: {prompt_name}")
-        
-        result = await self.client.get_prompt(
-            prompt_name,
-            arguments=arguments or {}
-        )
-        
-        # Convert to standard message format
-        messages = []
-        for msg in result.messages:
-            messages.append({
+        result = await self.session.get_prompt(prompt_name, arguments=arguments or {})
+
+        return [
+            {
                 "role": msg.role,
-                "content": msg.content.text if hasattr(msg.content, 'text') else str(msg.content)
-            })
-        
-        return messages
-    
+                "content": (
+                    msg.content.text
+                    if hasattr(msg.content, "text")
+                    else str(msg.content)
+                ),
+            }
+            for msg in result.messages
+        ]
+
+    # ------------------------------------------------------------------
+    # Convenience accessors (require discover() to have been called)
+    # ------------------------------------------------------------------
+
     def list_tools(self) -> List[ToolInfo]:
-        """Get list of available tools (must call discover() first)."""
         return list(self.tools.values())
-    
+
     def list_resources(self) -> List[ResourceInfo]:
-        """Get list of available resources (must call discover() first)."""
         return list(self.resources.values())
-    
+
     def list_prompts(self) -> List[PromptInfo]:
-        """Get list of available prompts (must call discover() first)."""
         return list(self.prompts.values())
-    
+
     def get_tool_info(self, tool_name: str) -> Optional[ToolInfo]:
-        """Get information about a specific tool."""
         return self.tools.get(tool_name)
-    
+
     def get_resource_info(self, uri: str) -> Optional[ResourceInfo]:
-        """Get information about a specific resource."""
         return self.resources.get(uri)
-    
+
     def get_prompt_info(self, prompt_name: str) -> Optional[PromptInfo]:
-        """Get information about a specific prompt."""
         return self.prompts.get(prompt_name)
